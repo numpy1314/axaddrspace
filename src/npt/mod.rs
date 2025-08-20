@@ -8,6 +8,9 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_arch = "aarch64")]{
         /// The architecture-specific nested page table for two-stage address translation.
         pub type NestedPageTable<H> = arch::NestedPageTable<H>;
+    } else if #[cfg(target_arch = "loongarch64")] {
+        /// The architecture-specific page table.
+        pub type NestedPageTable<H> = arch::NestedPageTable<H>;
     }
 }
 
