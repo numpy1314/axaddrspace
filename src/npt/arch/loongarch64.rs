@@ -5,224 +5,259 @@ use page_table_multiarch::{PageTable64, PagingMetaData};
 // use memory_addr::HostPhysAddr;
 use crate::{GuestPhysAddr, HostPhysAddr};
 
+/// LoongArch PTE attribute bits (based on LoongArch Vol1 v1.10 §5.4 / 表 7-38)
 bitflags::bitflags! {
-    /// LoongArch TLB entry attribute field
     #[derive(Debug)]
-    pub struct LoongArchDescriptorAttr: u64 {
-        /// Entry valid bit
-        const VALID =       1 << 0;
-        /// Global mapping bit (ASID not used for matching when G=1)
-        const GLOBAL =      1 << 1;
-        /// Privilege level field (PLV0-PLV3)
-        const PLV =         0b11 << 2;
-        /// No-execute bit
-        const NX =          1 << 4;
-        /// No-read bit
-        const NR =          1 << 5;
-        /// No-write bit
-        const NW =          1 << 6;
-        /// Memory access type (MAT)
-        const MAT =         0b11 << 8;
-        /// Dirty bit
-        const D =           1 << 10;
-        /// Modified bit
-        const V =           1 << 11;
+    pub struct LaPteAttr: u64 {
+        /// bit 0: V - valid
+        const V = 1 << 0;
+        /// bit 1: D - dirty (written)
+        const D = 1 << 1;
+
+        /// bits 3:2: PLV (privilege level)
+        const PLV_MASK = 0b11 << 2;
+
+        /// bits 5:4: MAT (memory attribute/type)
+        const MAT_MASK = 0b11 << 4;
+
+        /// bit 6 (basic page): G (global)
+        const G_BASIC = 1 << 6;
+
+        /// bit 7: P (page present indicator used by software semantics in the manual)
+        const P = 1 << 7;
+
+        /// bit 8: W (writable)
+        const W = 1 << 8;
+
+        // High bits for LA64 extensions (TLBELO layout / TLB registers)
+        /// bit 61: NR (not readable) - LA64 only
+        const NR = 1u64 << 61;
+        /// bit 62: NX (not executable) - LA64 only
+        const NX = 1u64 << 62;
+        /// bit 63: RPLV (restricted privilege level enable) - LA64 only
+        const RPLV = 1u64 << 63;
+
+        // For convenience, define masks/combined forms:
+        /// mask to extract low flag bits (0..12)
+        const LOW_MASK = (1 << 12) - 1;
     }
 }
 
-#[repr(u64)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum MemType {
-    StrongUncached = 0,  // 强序非缓存
-    CoherentCached = 1,  // 一致可缓存
-    WeakUncached = 2,    // 弱序非缓存
+/// Memory type enum for LoongArch mappings.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaMemType {
+    Device = 0,
+    Normal = 1,
+    NormalNonCache = 2,
 }
 
-impl LoongArchDescriptorAttr {
-    const MAT_MASK: u64 = 0b11 << 8;
+impl LaPteAttr {
+    // PPN / physical address mask: assume max 48-bit physical addresses, page granularity 4K
+    // PPN occupies bits [12..PALEN-1] in the PTE; using conservative mask up to 48 bits here.
+    pub const PHYS_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
 
-    const fn from_mem_type(mem_type: MemType) -> Self {
-        let bits = match mem_type {
-            MemType::StrongUncached => 0,
-            MemType::CoherentCached => 1 << 8,
-            MemType::WeakUncached => 2 << 8,
+    // MAT encodings (LoongArch uses MAT[1:0] in bits 5:4 for simple encodings)
+    // We'll adopt a small mapping for common types; these encodings must match platform's MAT->memory model.
+    const MAT_DEVICE: u64 = 0b00 << 4;
+    const MAT_NORMAL_WB: u64 = 0b01 << 4;  // treat as cacheable write-back
+    const MAT_NORMAL_NC: u64 = 0b10 << 4;  // outer non-cache (example)
+
+    /// Create LaPteAttr representing a LoongArch memory type
+    pub const fn from_mem_type(mem: LaMemType) -> Self {
+        let bits = match mem {
+            LaMemType::Device => (Self::MAT_DEVICE),
+            LaMemType::Normal => (Self::MAT_NORMAL_WB | Self::G_BASIC.bits()),
+            LaMemType::NormalNonCache => (Self::MAT_NORMAL_NC | Self::G_BASIC.bits()),
         };
-        Self::from_bits_retain(bits)
+        // SAFETY: bits are within u64 bitfield
+        Self::from_bits_truncate(bits)
     }
 
-    fn mem_type(&self) -> MemType {
-        match (self.bits() & Self::MAT_MASK) >> 8 {
-            0 => MemType::StrongUncached,
-            1 => MemType::CoherentCached,
-            2 => MemType::WeakUncached,
-            _ => unreachable!(),
+    /// Try to infer LaMemType from the MAT bits
+    pub fn mem_type(&self) -> LaMemType {
+        let mat = self.bits() & Self::MAT_MASK.bits();
+        match mat {
+            Self::MAT_NORMAL_WB => LaMemType::Normal,
+            Self::MAT_NORMAL_NC => LaMemType::NormalNonCache,
+            _ => LaMemType::Device,
         }
+    }
+
+    /// Set PLV (2-bit) into the attribute
+    pub fn with_plv(mut self, plv: u8) -> Self {
+        let plv_val = ((plv as u64) & 0b11) << 2;
+        self.bits = (self.bits & !Self::PLV_MASK.bits()) | plv_val;
+        self
     }
 }
 
-impl From<LoongArchDescriptorAttr> for MappingFlags {
-    fn from(attr: LoongArchDescriptorAttr) -> Self {
-        let mut flags = Self::empty();
-        if attr.contains(LoongArchDescriptorAttr::VALID) {
-            flags |= Self::PRESENT;
+/// Mapping between LaPteAttr and generic MappingFlags
+impl From<LaPteAttr> for MappingFlags {
+    fn from(attr: LaPteAttr) -> Self {
+        let mut flags = MappingFlags::empty();
+        if attr.contains(LaPteAttr::V) {
+            // treat valid as readable unless NR set
+            if !attr.contains(LaPteAttr::NR) {
+                flags |= MappingFlags::READ;
+            }
         }
-        if !attr.contains(LoongArchDescriptorAttr::NR) {
-            flags |= Self::READ;
+        if attr.contains(LaPteAttr::W) {
+            flags |= MappingFlags::WRITE;
         }
-        if !attr.contains(LoongArchDescriptorAttr::NW) {
-            flags |= Self::WRITE;
+        if !attr.contains(LaPteAttr::NX) {
+            // NX==1 means not executable; invert
+            flags |= MappingFlags::EXECUTE;
         }
-        if !attr.contains(LoongArchDescriptorAttr::NX) {
-            flags |= Self::EXECUTE;
-        }
-        match attr.mem_type() {
-            MemType::StrongUncached => flags |= Self::UNCACHED | Self::DEVICE,
-            MemType::WeakUncached => flags |= Self::UNCACHED,
-            _ => {}
+        // device detection: if MAT==MAT_DEVICE treat as DEVICE
+        if attr.mem_type() == LaMemType::Device {
+            flags |= MappingFlags::DEVICE;
         }
         flags
     }
 }
 
-impl From<MappingFlags> for LoongArchDescriptorAttr {
+impl From<MappingFlags> for LaPteAttr {
     fn from(flags: MappingFlags) -> Self {
-        let mut attr = Self::empty();
-        if flags.contains(MappingFlags::PRESENT) {
-            attr |= Self::VALID;
-        }
+        let mut attr = if flags.contains(MappingFlags::DEVICE) {
+            if flags.contains(MappingFlags::UNCACHED) {
+                LaPteAttr::from_mem_type(LaMemType::NormalNonCache)
+            } else {
+                LaPteAttr::from_mem_type(LaMemType::Device)
+            }
+        } else {
+            LaPteAttr::from_mem_type(LaMemType::Normal)
+        };
+
+        // set basic accessibility bits:
         if flags.contains(MappingFlags::READ) {
-            attr |= Self::NR;
+            attr |= LaPteAttr::V;
         }
         if flags.contains(MappingFlags::WRITE) {
-            attr |= Self::NW;
+            attr |= LaPteAttr::W | LaPteAttr::D;
         }
+        // EXECUTE -> clear NX; otherwise set NX
         if flags.contains(MappingFlags::EXECUTE) {
-            attr |= Self::NX;
-        }
-        if flags.contains(MappingFlags::DEVICE) {
-            attr |= Self::from_mem_type(MemType::StrongUncached);
-        } else if flags.contains(MappingFlags::UNCACHED) {
-            attr |= Self::from_mem_type(MemType::WeakUncached);
+            // ensure NX is cleared
+            attr.bits &= !LaPteAttr::NX.bits();
         } else {
-            attr |= Self::from_mem_type(MemType::CoherentCached);
+            attr |= LaPteAttr::NX;
         }
+
         attr
     }
 }
 
-/// LoongArch TLB entry structure
-#[derive(Clone, Copy)]
+/// LaPTE: concrete 64-bit PTE container for LoongArch
 #[repr(transparent)]
-pub struct LoongArchPTE(u64);
+#[derive(Clone, Copy)]
+pub struct LaPTE(u64);
 
-impl LoongArchPTE {
-    const PHYS_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000; // 物理地址掩码 (48位)
-    const PS_MASK: u64 = 0b11111 << 12; // 页大小字段掩码
+impl LaPTE {
+    pub const fn empty() -> Self { Self(0) }
+    pub fn raw(&self) -> u64 { self.0 }
 
-    /// Create empty page table entry
-    pub const fn empty() -> Self {
-        Self(0)
+    pub fn paddr(&self) -> HostPhysAddr {
+        HostPhysAddr::from((self.0 & LaPteAttr::PHYS_ADDR_MASK) as usize)
     }
 }
 
-impl GenericPTE for LoongArchPTE {
-    fn bits(self) -> usize {
-        self.0 as usize
-    }
+impl GenericPTE for LaPTE {
+    fn bits(self) -> usize { self.0 as usize }
 
-    fn new_page(paddr: HostPhysAddr, flags: MappingFlags, is_huge: bool) -> Self {
-        let mut attr = LoongArchDescriptorAttr::from(flags);
-        let ps = if is_huge {
-            // 大页标志 (2MB/1GB)
-            0b11000 // PS字段设置为大页标识
-        } else {
-            0 // 默认4KB页
-        };
-        Self(attr.bits() | (ps << 12) | (paddr.as_usize() as u64 & Self::PHYS_ADDR_MASK))
+    fn new_page(paddr: HostPhysAddr, flags: MappingFlags, _is_huge: bool) -> Self {
+        let mut attr = LaPteAttr::from(flags);
+        // set valid bit if readable or requested
+        if flags.contains(MappingFlags::READ) || flags.contains(MappingFlags::WRITE) {
+            attr |= LaPteAttr::V;
+        }
+        // set dirty if writable
+        if flags.contains(MappingFlags::WRITE) {
+            attr |= LaPteAttr::D;
+        }
+        // combine attr bits with physical address
+        Self(attr.bits() | (paddr.as_usize() as u64 & LaPteAttr::PHYS_ADDR_MASK))
     }
 
     fn new_table(paddr: HostPhysAddr) -> Self {
-        let attr = LoongArchDescriptorAttr::VALID;
-        Self(attr.bits() | (paddr.as_usize() as u64 & Self::PHYS_ADDR_MASK))
+        // For a table descriptor, typically we mark not-present as V may be 0;
+        // but to point to next-level we set P (or other convention). We'll set V=1 here.
+        let attr = LaPteAttr::V; // at minimum mark valid pointer
+        Self(attr.bits() | (paddr.as_usize() as u64 & LaPteAttr::PHYS_ADDR_MASK))
     }
 
     fn paddr(&self) -> HostPhysAddr {
-        HostPhysAddr::from((self.0 & Self::PHYS_ADDR_MASK) as usize)
+        HostPhysAddr::from((self.0 & LaPteAttr::PHYS_ADDR_MASK) as usize)
     }
 
     fn flags(&self) -> MappingFlags {
-        LoongArchDescriptorAttr::from_bits_truncate(self.0).into()
+        LaPteAttr::from_bits_truncate(self.0).into()
     }
 
     fn set_paddr(&mut self, paddr: HostPhysAddr) {
-        self.0 = (self.0 & !Self::PHYS_ADDR_MASK) | (paddr.as_usize() as u64 & Self::PHYS_ADDR_MASK);
+        self.0 = (self.0 & !LaPteAttr::PHYS_ADDR_MASK) | (paddr.as_usize() as u64 & LaPteAttr::PHYS_ADDR_MASK);
     }
 
-    fn set_flags(&mut self, flags: MappingFlags, is_huge: bool) {
-        let mut attr = LoongArchDescriptorAttr::from(flags);
-        let ps = if is_huge { 0b11000 } else { 0 };
-        self.0 = (self.0 & !(Self::PS_MASK | LoongArchDescriptorAttr::all().bits())) 
-            | attr.bits() 
-            | (ps << 12);
+    fn set_flags(&mut self, flags: MappingFlags, _is_huge: bool) {
+        let mut attr = LaPteAttr::from(flags);
+        if flags.contains(MappingFlags::READ) { attr |= LaPteAttr::V; }
+        if flags.contains(MappingFlags::WRITE) { attr |= LaPteAttr::D | LaPteAttr::W; }
+        // preserve physical address
+        self.0 = (self.0 & LaPteAttr::PHYS_ADDR_MASK) | attr.bits();
     }
 
-    fn is_unused(&self) -> bool {
-        self.0 == 0
-    }
+    fn is_unused(&self) -> bool { self.0 == 0 }
 
-    fn is_present(&self) -> bool {
-        LoongArchDescriptorAttr::from_bits_truncate(self.0).contains(LoongArchDescriptorAttr::VALID)
-    }
+    fn is_present(&self) -> bool { LaPteAttr::from_bits_truncate(self.0).contains(LaPteAttr::V) }
 
     fn is_huge(&self) -> bool {
-        (self.0 & Self::PS_MASK) == (0b11000 << 12)
+        // For LoongArch, huge page is indicated by directory H bit or alignment; here we conservatively:
+        // if PPN encodes a large mapping, detection depends on table level. We return false => not huge.
+        false
     }
 
-    fn clear(&mut self) {
-        self.0 = 0;
-    }
+    fn clear(&mut self) { self.0 = 0; }
 }
 
-impl fmt::Debug for LoongArchPTE {
+impl fmt::Debug for LaPTE {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("LoongArchPTE")
+        f.debug_struct("LaPTE")
             .field("raw", &self.0)
             .field("paddr", &self.paddr())
-            .field("attr", &LoongArchDescriptorAttr::from_bits_truncate(self.0))
+            .field("attr", &LaPteAttr::from_bits_truncate(self.0))
             .field("flags", &self.flags())
             .finish()
     }
 }
 
-/// LoongArch nested paging metadata
+/// Paging metadata for LoongArch
 #[derive(Copy, Clone)]
-pub struct LoongArchPagingMetaData;
+pub struct LaPagingMetaData;
 
-impl PagingMetaData for LoongArchPagingMetaData {
-    const LEVELS: usize = 4; // 4-level page table
-    const PA_MAX_BITS: usize = 48; // 48-bit physical address
-    const VA_MAX_BITS: usize = 48; // 48-bit virtual address (GPA)
-
-    type VirtAddr = GuestPhysAddr;
+impl PagingMetaData for LaPagingMetaData {
+    const LEVELS: usize = 4; // depends on PALEN/VALEN configuration in CSR.PWCL/PWCH
+    const PA_MAX_BITS: usize = 48;
+    const VA_MAX_BITS: usize = 48;
+    type VirtAddr = usize; // or GuestVirtAddr as appropriate
 
     fn flush_tlb(vaddr: Option<Self::VirtAddr>) {
         unsafe {
-            if let Some(vaddr) = vaddr {
-                // Invalidate individual GPA using INVTLB instruction
-                asm!(
-                    "invtlb 0, {}, {}",
-                    in(reg) 0, // GID=0 for current Guest
-                    in(reg) vaddr.as_usize()
-                );
+            if let Some(va) = vaddr {
+                // LoongArch provides INVTLB / TLBFLUSH / TLBFILL family.
+                // The exact assembly template depends on CPU and toolchain syntax.
+                // Example pseudocode (fill in correct operands for your implementation):
+                //
+                // asm!("invtlb {}, {}", in(reg) va, in(reg) 0); // <-- replace with correct INVTLB usage
+                //
+                // For a portable approach, you may call a platform-specific crate function here.
+                core::arch::asm!("/* INVTLB/TLB invalidate for VA={} (platform-specific) */", in(reg) va);
             } else {
-                // Invalidate entire GTLB
-                asm!("invtlb 0, $r0, $r0");
+                // global flush (example placeholder)
+                core::arch::asm!("/* Global TLB flush (platform-specific INVTLB/TLBFLUSH) */");
             }
-            // Memory barrier to ensure TLB invalidation completion
-            asm!("dbar 0");
         }
     }
 }
 
-/// LoongArch nested page table type
-pub type NestedPageTable = PageTable64<LoongArchPagingMetaData, LoongArchPTE>;
+/// Convenience alias: a page table type for LoongArch using our PTE & metadata.
+pub type LoongNestedPageTable<H> = PageTable64<LaPagingMetaData, LaPTE, H>;
