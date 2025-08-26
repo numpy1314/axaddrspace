@@ -5,7 +5,7 @@ use page_table_multiarch::{PageTable64, PagingMetaData};
 // use memory_addr::HostPhysAddr;
 use crate::{GuestPhysAddr, HostPhysAddr};
 
-/// LoongArch PTE attribute bits (based on LoongArch Vol1 v1.10 §5.4 / 表 7-38)
+// LoongArch PTE attribute bits (based on LoongArch Vol1 v1.10 §5.4 / 表 7-38)
 bitflags::bitflags! {
     #[derive(Debug)]
     pub struct LaPteAttr: u64 {
@@ -60,15 +60,15 @@ impl LaPteAttr {
     // MAT encodings (LoongArch uses MAT[1:0] in bits 5:4 for simple encodings)
     // We'll adopt a small mapping for common types; these encodings must match platform's MAT->memory model.
     const MAT_DEVICE: u64 = 0b00 << 4;
-    const MAT_NORMAL_WB: u64 = 0b01 << 4;  // treat as cacheable write-back
-    const MAT_NORMAL_NC: u64 = 0b10 << 4;  // outer non-cache (example)
+    const MAT_NORMAL_WB: u64 = 0b01 << 4; // treat as cacheable write-back
+    const MAT_NORMAL_NC: u64 = 0b10 << 4; // outer non-cache (example)
 
     /// Create LaPteAttr representing a LoongArch memory type
     pub const fn from_mem_type(mem: LaMemType) -> Self {
         let bits = match mem {
-            LaMemType::Device => (Self::MAT_DEVICE),
-            LaMemType::Normal => (Self::MAT_NORMAL_WB | Self::G_BASIC.bits()),
-            LaMemType::NormalNonCache => (Self::MAT_NORMAL_NC | Self::G_BASIC.bits()),
+            LaMemType::Device => Self::MAT_DEVICE,
+            LaMemType::Normal => Self::MAT_NORMAL_WB | Self::G_BASIC.bits(),
+            LaMemType::NormalNonCache => Self::MAT_NORMAL_NC | Self::G_BASIC.bits(),
         };
         // SAFETY: bits are within u64 bitfield
         Self::from_bits_truncate(bits)
@@ -85,10 +85,10 @@ impl LaPteAttr {
     }
 
     /// Set PLV (2-bit) into the attribute
-    pub fn with_plv(mut self, plv: u8) -> Self {
+    pub fn with_plv(self, plv: u8) -> Self {
         let plv_val = ((plv as u64) & 0b11) << 2;
-        self.bits = (self.bits & !Self::PLV_MASK.bits()) | plv_val;
-        self
+        let bits = (self.bits() & !Self::PLV_MASK.bits()) | plv_val;
+        Self::from_bits_retain(bits)
     }
 }
 
@@ -139,7 +139,7 @@ impl From<MappingFlags> for LaPteAttr {
         // EXECUTE -> clear NX; otherwise set NX
         if flags.contains(MappingFlags::EXECUTE) {
             // ensure NX is cleared
-            attr.bits &= !LaPteAttr::NX.bits();
+            attr = LaPteAttr::from_bits_truncate(attr.bits() & !LaPteAttr::NX.bits());
         } else {
             attr |= LaPteAttr::NX;
         }
@@ -154,8 +154,12 @@ impl From<MappingFlags> for LaPteAttr {
 pub struct LaPTE(u64);
 
 impl LaPTE {
-    pub const fn empty() -> Self { Self(0) }
-    pub fn raw(&self) -> u64 { self.0 }
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub fn raw(&self) -> u64 {
+        self.0
+    }
 
     pub fn paddr(&self) -> HostPhysAddr {
         HostPhysAddr::from((self.0 & LaPteAttr::PHYS_ADDR_MASK) as usize)
@@ -163,7 +167,9 @@ impl LaPTE {
 }
 
 impl GenericPTE for LaPTE {
-    fn bits(self) -> usize { self.0 as usize }
+    fn bits(self) -> usize {
+        self.0 as usize
+    }
 
     fn new_page(paddr: HostPhysAddr, flags: MappingFlags, _is_huge: bool) -> Self {
         let mut attr = LaPteAttr::from(flags);
@@ -195,20 +201,29 @@ impl GenericPTE for LaPTE {
     }
 
     fn set_paddr(&mut self, paddr: HostPhysAddr) {
-        self.0 = (self.0 & !LaPteAttr::PHYS_ADDR_MASK) | (paddr.as_usize() as u64 & LaPteAttr::PHYS_ADDR_MASK);
+        self.0 = (self.0 & !LaPteAttr::PHYS_ADDR_MASK)
+            | (paddr.as_usize() as u64 & LaPteAttr::PHYS_ADDR_MASK);
     }
 
     fn set_flags(&mut self, flags: MappingFlags, _is_huge: bool) {
         let mut attr = LaPteAttr::from(flags);
-        if flags.contains(MappingFlags::READ) { attr |= LaPteAttr::V; }
-        if flags.contains(MappingFlags::WRITE) { attr |= LaPteAttr::D | LaPteAttr::W; }
+        if flags.contains(MappingFlags::READ) {
+            attr |= LaPteAttr::V;
+        }
+        if flags.contains(MappingFlags::WRITE) {
+            attr |= LaPteAttr::D | LaPteAttr::W;
+        }
         // preserve physical address
         self.0 = (self.0 & LaPteAttr::PHYS_ADDR_MASK) | attr.bits();
     }
 
-    fn is_unused(&self) -> bool { self.0 == 0 }
+    fn is_unused(&self) -> bool {
+        self.0 == 0
+    }
 
-    fn is_present(&self) -> bool { LaPteAttr::from_bits_truncate(self.0).contains(LaPteAttr::V) }
+    fn is_present(&self) -> bool {
+        LaPteAttr::from_bits_truncate(self.0).contains(LaPteAttr::V)
+    }
 
     fn is_huge(&self) -> bool {
         // For LoongArch, huge page is indicated by directory H bit or alignment; here we conservatively:
@@ -216,7 +231,9 @@ impl GenericPTE for LaPTE {
         false
     }
 
-    fn clear(&mut self) { self.0 = 0; }
+    fn clear(&mut self) {
+        self.0 = 0;
+    }
 }
 
 impl fmt::Debug for LaPTE {
@@ -238,26 +255,25 @@ impl PagingMetaData for LaPagingMetaData {
     const LEVELS: usize = 4; // depends on PALEN/VALEN configuration in CSR.PWCL/PWCH
     const PA_MAX_BITS: usize = 48;
     const VA_MAX_BITS: usize = 48;
-    type VirtAddr = usize; // or GuestVirtAddr as appropriate
-
+    type VirtAddr = GuestPhysAddr; // or GuestVirtAddr as appropriate
+    // TODO: based on loongarch64 lvz, page: 15
     fn flush_tlb(vaddr: Option<Self::VirtAddr>) {
         unsafe {
             if let Some(va) = vaddr {
-                // LoongArch provides INVTLB / TLBFLUSH / TLBFILL family.
-                // The exact assembly template depends on CPU and toolchain syntax.
-                // Example pseudocode (fill in correct operands for your implementation):
-                //
-                // asm!("invtlb {}, {}", in(reg) va, in(reg) 0); // <-- replace with correct INVTLB usage
-                //
-                // For a portable approach, you may call a platform-specific crate function here.
-                core::arch::asm!("/* INVTLB/TLB invalidate for VA={} (platform-specific) */", in(reg) va);
+                // flush single vaddr
+                let va_usize = va.as_usize();
+                asm!(
+                    "dbar 0",
+                    "invtlb 0x05, $r0, {va}",
+                    va = in(reg) va_usize,
+                );
             } else {
-                // global flush (example placeholder)
-                core::arch::asm!("/* Global TLB flush (platform-specific INVTLB/TLBFLUSH) */");
+                // flush all
+                asm!("dbar 0", "invtlb 0, $r0, $r0",);
             }
         }
     }
 }
 
 /// Convenience alias: a page table type for LoongArch using our PTE & metadata.
-pub type LoongNestedPageTable<H> = PageTable64<LaPagingMetaData, LaPTE, H>;
+pub type NestedPageTable<H> = PageTable64<LaPagingMetaData, LaPTE, H>;
