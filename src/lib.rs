@@ -19,6 +19,7 @@ pub use address_space::*;
 
 pub use frame::PhysFrame;
 pub use hal::AxMmHal;
+pub use npt::NestedPageTable;
 
 use axerrno::AxError;
 use memory_set::MappingError;
