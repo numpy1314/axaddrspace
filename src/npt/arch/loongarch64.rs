@@ -7,49 +7,39 @@ use crate::{GuestPhysAddr, HostPhysAddr};
 
 // LoongArch PTE attribute bits (based on LoongArch Vol1 v1.10 §5.4 / 表 7-38)
 bitflags::bitflags! {
-    #[derive(Debug)]
-    pub struct LaPteAttr: u64 {
-        /// bit 0: V - valid
-        const V = 1 << 0;
-        /// bit 1: D - dirty (written)
-        const D = 1 << 1;
+    /// Memory attribute fields in the LoongArch64 translation table format descriptors.
+    #[derive(Clone, Copy, Debug)]
+    pub struct LaPteAttr: usize {
+        const V = 1 << 0; // Valid
+        const D = 1 << 1; // Dirty
 
-        /// bits 3:2: PLV (privilege level)
-        const PLV_MASK = 0b11 << 2;
+        const PLV = 0b11 << 2; // Privilege Level Range
+        const PLV0 = 0b00 << 2; // PLV0
+        const PLV1 = 0b01 << 2; // PLV1
+        const PLV2 = 0b10 << 2; // PLV2
+        const PLV3 = 0b11 << 2; // PLV3
 
-        /// bits 5:4: MAT (memory attribute/type)
-        const MAT_MASK = 0b11 << 4;
+        const MAT = 0b11 << 4; // Memory Access Type Range
+        const MAT_SUC = 0b00 << 4; // Strongly-Ordered Uncached
+        const MAT_CC = 0b01 << 4; // Coherent Cached
+        const MAT_WB = 0b10 << 4; // Weakly-Ordered Uncached
 
-        /// bit 6 (basic page): G (global)
-        const G_BASIC = 1 << 6;
-
-        /// bit 7: P (page present indicator used by software semantics in the manual)
-        const P = 1 << 7;
-
-        /// bit 8: W (writable)
-        const W = 1 << 8;
-
-        // High bits for LA64 extensions (TLBELO layout / TLB registers)
-        /// bit 61: NR (not readable) - LA64 only
-        const NR = 1u64 << 61;
-        /// bit 62: NX (not executable) - LA64 only
-        const NX = 1u64 << 62;
-        /// bit 63: RPLV (restricted privilege level enable) - LA64 only
-        const RPLV = 1u64 << 63;
-
-        // For convenience, define masks/combined forms:
-        /// mask to extract low flag bits (0..12)
-        const LOW_MASK = (1 << 12) - 1;
+        const G = 1 << 6; // Global
+        const P = 1 << 7; // Present
+        const W = 1 << 8; // Writable
+        const NR = 1 << 61; // Not Readable
+        const NX = 1 << 62; // Not Executable
+        const RPLV = 1 << 63; // Relative Privilege Level Check
     }
 }
 
 /// Memory type enum for LoongArch mappings.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaMemType {
-    Device = 0,
-    Normal = 1,
-    NormalNonCache = 2,
+enum LaMemType {
+    MAT_SUC = 0,
+    MAT_CC = 1,
+    MAT_WB = 2,
 }
 
 impl LaPteAttr {
@@ -59,9 +49,9 @@ impl LaPteAttr {
 
     // MAT encodings (LoongArch uses MAT[1:0] in bits 5:4 for simple encodings)
     // We'll adopt a small mapping for common types; these encodings must match platform's MAT->memory model.
-    const MAT_DEVICE: u64 = 0b00 << 4;
-    const MAT_NORMAL_WB: u64 = 0b01 << 4; // treat as cacheable write-back
-    const MAT_NORMAL_NC: u64 = 0b10 << 4; // outer non-cache (example)
+    const MAT_SUC: u64 = 0b00 << 4;
+    const MAT_CC: u64 = 0b01 << 4;  // treat as cacheable write-back
+    const MAT_WB: u64 = 0b10 << 4;  // outer non-cache (example)
 
     /// Create LaPteAttr representing a LoongArch memory type
     pub const fn from_mem_type(mem: LaMemType) -> Self {
