@@ -3,7 +3,7 @@ use core::fmt;
 use page_table_entry::{GenericPTE, MappingFlags};
 use page_table_multiarch::{PageTable64, PagingMetaData};
 // use memory_addr::HostPhysAddr;
-use crate::{GuestPhysAddr, HostPhysAddr};
+use memory_addr::{HostPhysAddr, GuestPhysAddr};
 
 // LoongArch PTE attribute bits (based on LoongArch Vol1 v1.10 §5.4 / 表 7-38)
 bitflags::bitflags! {
@@ -56,9 +56,9 @@ impl LaPteAttr {
     /// Create LaPteAttr representing a LoongArch memory type
     pub const fn from_mem_type(mem: LaMemType) -> Self {
         let bits = match mem {
-            LaMemType::Device => Self::MAT_DEVICE,
-            LaMemType::Normal => Self::MAT_NORMAL_WB | Self::G_BASIC.bits(),
-            LaMemType::NormalNonCache => Self::MAT_NORMAL_NC | Self::G_BASIC.bits(),
+            LaMemType::Device => Self::MAT_SUC,
+            LaMemType::Normal => Self::MAT_CC | Self::G_BASIC.bits(),
+            LaMemType::NormalNonCache => Self::MAT_WB | Self::G_BASIC.bits(),
         };
         // SAFETY: bits are within u64 bitfield
         Self::from_bits_truncate(bits)
